@@ -1,3 +1,4 @@
+# mirror: build via NuvioMobile-pip
 name: Build Test IPA
 
 on:
