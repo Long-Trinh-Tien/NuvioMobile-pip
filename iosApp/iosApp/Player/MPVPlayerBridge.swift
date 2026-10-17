@@ -5,9 +5,22 @@ import AVKit
 import Libmpv
 import ComposeApp
 import Darwin
+import ObjectiveC
 
 private func zdLog(_ message: String) {
     NSLog("%@", message)
+}
+
+/// Tiny helper view that reports when the player's view actually lands in (or
+/// leaves) a window. UIViewController has no didMoveToWindow, so the PiP
+/// controller creation hangs off this subview instead.
+final class ZDWindowObserverView: UIView {
+    var onWindowChange: ((Bool) -> Void)?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        onWindowChange?(window != nil)
+    }
 }
 
 // MARK: - Player Bridge Implementation (Kotlin protocol conformance)
@@ -276,6 +289,9 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
     private var pipBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var lastKnownDurationSeconds: Double = 0
     private var pipPossibleObservation: NSKeyValueObservation?
+    private var pipCreatedWhileActive = false
+    private var pipRebuildCount = 0
+    private let windowObserverView = ZDWindowObserverView()
     private var externallyManagedViewSize: CGSize?
     private var pendingSurfaceLayoutWorkItems: [DispatchWorkItem] = []
     private var pendingLoadRequest: PendingLoadRequest?
@@ -375,7 +391,16 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         videoLayer.position = .zero
         view.layer.addSublayer(videoLayer)
         layoutVideoLayer()
-        setupPictureInPicture()
+        setupDisplayLayerTimebase()
+
+        windowObserverView.frame = .zero
+        windowObserverView.isUserInteractionEnabled = false
+        windowObserverView.onWindowChange = { [weak self] inWindow in
+            guard let self, inWindow else { return }
+            self.setupPictureInPicture(reason: "viewInWindow")
+            zdLog(self.pipProxyDiagnostics("viewInWindow"))
+        }
+        view.addSubview(windowObserverView)
 
         setupMpv()
         activateAudioSessionForPlayback()
@@ -384,11 +409,11 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
 
     // MARK: - Picture in Picture
 
-    private func setupPictureInPicture() {
-        guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
-
-        // Drive the display layer from the host clock so enqueued frames present
-        // smoothly and the PiP window has a valid timebase.
+    /// Drive the display layer from the host clock so enqueued frames present
+    /// smoothly and the PiP window has a valid timebase. Set once (idempotent);
+    /// re-setting the timebase later would disturb playback.
+    private func setupDisplayLayerTimebase() {
+        guard videoLayer.controlTimebase == nil else { return }
         var timebase: CMTimebase?
         if CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
                                            sourceClock: CMClockGetHostTimeClock(),
@@ -398,6 +423,26 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
             CMTimebaseSetTime(timebase, time: .zero)
             CMTimebaseSetRate(timebase, rate: 1.0)
         }
+    }
+
+    /// Create the PiP controller only once the view is attached to a window.
+    /// The AVKit platform proxy resolves its scene-session identifier when it is
+    /// set up (first layout); a controller created in viewDidLoad has no window
+    /// yet, and a proxy created while the scene is inactive (e.g. an episode
+    /// switch while PiP is up) caches a nil identifier that SpringBoard's remote
+    /// object keeps forever. The Home-swipe check then fails
+    /// (`matchesSceneIdentifier{false}`) and PiP only comes up on a second try.
+    /// Creating with a window + active scene, plus the heal below, keeps the
+    /// identifier correct.
+    private func setupPictureInPicture(reason: String) {
+        guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
+        guard pipController == nil else { return }
+        guard view.window != nil else {
+            zdLog("[PiP] setup skipped (\(reason)): no window yet")
+            return
+        }
+
+        setupDisplayLayerTimebase()
 
         let source = AVPictureInPictureController.ContentSource(
             sampleBufferDisplayLayer: videoLayer,
@@ -410,8 +455,156 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
             zdLog("[PiP] possible -> \(String(describing: change.newValue))")
         }
         pipController = controller
+        pipCreatedWhileActive = Self.zdSceneIsForegroundActive()
         _ = Self.forceCompositeFn
-        zdLog("[PiP] ready (auto-start from inline enabled)")
+        zdLog("[PiP] ready (auto-start from inline enabled) reason=\(reason) createdWhileActive=\(pipCreatedWhileActive)")
+        zdLog(pipProxyDiagnostics("created"))
+
+        // The AVKit adapter/proxy appears on the first layout pass; sample it
+        // shortly after creation and heal a broken scene cache.
+        for delay in [0.7, 2.2] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, let pip = self.pipController else { return }
+                zdLog(self.pipProxyDiagnostics("created+\(delay)"))
+                self.healPipControllerIfNeeded(reason: "created+\(delay)", pip: pip)
+            }
+        }
+    }
+
+    /// Called when the app becomes active; re-checks the PiP proxy's scene
+    /// cache and rebuilds the controller when it is broken (e.g. it was created
+    /// during a background episode switch / PiP restore transition).
+    @objc private func appDidBecomeActive() {
+        guard mpv != nil, isViewLoaded, view.window != nil else { return }
+        zdLog(pipProxyDiagnostics("didBecomeActive"))
+        if let pip = pipController {
+            healPipControllerIfNeeded(reason: "didBecomeActive", pip: pip)
+        } else {
+            setupPictureInPicture(reason: "didBecomeActive")
+        }
+    }
+
+    private func healPipControllerIfNeeded(reason: String, pip: AVPictureInPictureController) {
+        guard pipRebuildCount < 2 else { return }
+        guard !pip.isPictureInPictureActive, !isPipActive, !pipStopForForeground else { return }
+        guard view.window != nil, Self.zdSceneIsForegroundActive() else { return }
+        guard let proxy = Self.zdFindPipProxy(in: pip) else { return }
+        let session = Self.zdIvarString(proxy, "_sceneSessionPersistentIdentifier")
+        guard session != "missing", session != "?" else { return }
+        let appScene = Self.zdAppSceneSessionId()
+        guard session != appScene else { return }
+        zdLog("[PiP] heal: scene mismatch (session=\(session) app=\(appScene)) -> rebuilding (\(reason))")
+        rebuildPipController(reason: reason)
+    }
+
+    private func rebuildPipController(reason: String) {
+        guard let old = pipController else {
+            setupPictureInPicture(reason: "rebuild:\(reason)")
+            return
+        }
+        guard !old.isPictureInPictureActive, !isPipActive, !pipStopForForeground else { return }
+        pipRebuildCount += 1
+        pipPossibleObservation?.invalidate()
+        pipPossibleObservation = nil
+        old.delegate = nil
+        pipController = nil
+        zdLog("[PiP] rebuild #\(pipRebuildCount) (\(reason))")
+        setupPictureInPicture(reason: "rebuild:\(reason)")
+    }
+
+    // MARK: - PiP diagnostics (read-only, for log forensics)
+
+    private func pipProxyDiagnostics(_ tag: String) -> String {
+        let appScene = Self.zdAppSceneSessionId()
+        guard let pip = pipController else {
+            return "[PiP] diag \(tag): no-controller app=\(appScene)"
+        }
+        guard let proxy = Self.zdFindPipProxy(in: pip) else {
+            return "[PiP] diag \(tag): proxy-not-found app=\(appScene) possible=\(pip.isPictureInPicturePossible) active=\(pip.isPictureInPictureActive)"
+        }
+        let session = Self.zdIvarString(proxy, "_sceneSessionPersistentIdentifier")
+        let match = session == appScene ? "Y" : "N"
+        return "[PiP] diag \(tag): proxy=\(String(describing: Unmanaged.passUnretained(proxy).toOpaque())) session=\(session) app=\(appScene) match=\(match) possible=\(Self.zdIvarBool(proxy, "_isPictureInPicturePossible")) active=\(Self.zdIvarBool(proxy, "_isPictureInPictureActive")) shouldStart=\(Self.zdIvarBool(proxy, "_pictureInPictureShouldStartWhenEnteringBackground"))"
+    }
+
+    private static func zdAppScene() -> UIWindowScene? {
+        if let active = UIApplication.shared.connectedScenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene {
+            return active
+        }
+        return UIApplication.shared.connectedScenes.first as? UIWindowScene
+    }
+
+    private static func zdSceneIsForegroundActive() -> Bool {
+        if let scene = zdAppScene() { return scene.activationState == .foregroundActive }
+        return UIApplication.shared.applicationState == .active
+    }
+
+    private static func zdAppSceneSessionId() -> String {
+        return zdAppScene()?.session.persistentIdentifier ?? "nil"
+    }
+
+    private static func zdIvarString(_ obj: AnyObject, _ name: String) -> String {
+        guard let iv = class_getInstanceVariable(type(of: obj), name) else { return "missing" }
+        guard let value = object_getIvar(obj, iv) else { return "nil" }
+        if let s = value as? String { return s }
+        if let uuid = value as? UUID { return uuid.uuidString }
+        return "?"
+    }
+
+    private static func zdIvarBool(_ obj: AnyObject, _ name: String) -> String {
+        guard let iv = class_getInstanceVariable(type(of: obj), name) else { return "?" }
+        let base = Unmanaged.passUnretained(obj).toOpaque()
+        let byte = base.advanced(by: ivar_getOffset(iv)).load(as: UInt8.self)
+        return byte != 0 ? "Y" : "N"
+    }
+
+    /// Breadth-first search through object-typed ivars (and shallow collections)
+    /// for the AVKit platform proxy (`PGPictureInPictureProxy`) under the
+    /// controller. Depth-capped and count-capped; read-only.
+    private static func zdFindPipProxy(in root: AnyObject) -> NSObject? {
+        var queue: [AnyObject] = [root]
+        var depths: [Int] = [0]
+        var visited = Set<ObjectIdentifier>()
+        var index = 0
+        while index < queue.count, visited.count < 400 {
+            let obj = queue[index]
+            let depth = depths[index]
+            index += 1
+            let oid = ObjectIdentifier(obj)
+            if visited.contains(oid) { continue }
+            visited.insert(oid)
+            guard let cls = object_getClass(obj) else { continue }
+            let name = NSStringFromClass(cls)
+            if name.contains("PictureInPictureProxy") { return obj as? NSObject }
+            if depth >= 4 { continue }
+            if let arr = obj as? [Any] {
+                for element in arr {
+                    queue.append(element as AnyObject)
+                    depths.append(depth + 1)
+                }
+                continue
+            }
+            guard depth == 0 || name.contains("AVPictureInPicture") || name.contains("PG") || name.contains("AVKit") else { continue }
+            var ivarClass: AnyClass? = cls
+            var hops = 0
+            while let current = ivarClass, hops < 4 {
+                var count: UInt32 = 0
+                if let ivars = class_copyIvarList(current, &count) {
+                    for i in 0..<Int(count) {
+                        let iv = ivars[i]
+                        guard let te = ivar_getTypeEncoding(iv), te.pointee == 0x40 else { continue }
+                        if let value = object_getIvar(obj, iv) {
+                            queue.append(value as AnyObject)
+                            depths.append(depth + 1)
+                        }
+                    }
+                    free(ivars)
+                }
+                ivarClass = class_getSuperclass(current)
+                hops += 1
+            }
+        }
+        return nil
     }
 
     // MARK: - PiP subtitle compositing + layer diagnostics
@@ -540,6 +733,8 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        setupPictureInPicture(reason: "viewDidAppear")
+        zdLog(pipProxyDiagnostics("viewDidAppear"))
         SystemUI.shared.playerDidBecomeVisible(self)
         refreshImmersiveSystemUI()
         becomeFirstResponder()
@@ -796,16 +991,20 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         let center = NotificationCenter.default
         center.removeObserver(self, name: UIApplication.didEnterBackgroundNotification, object: nil)
         center.removeObserver(self, name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.removeObserver(self, name: UIApplication.didBecomeActiveNotification, object: nil)
         center.addObserver(self, selector: #selector(enterBackground),
                            name: UIApplication.didEnterBackgroundNotification, object: nil)
         center.addObserver(self, selector: #selector(enterForeground),
                            name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(appDidBecomeActive),
+                           name: UIApplication.didBecomeActiveNotification, object: nil)
     }
 
     private func removePlaybackObservers() {
         let center = NotificationCenter.default
         center.removeObserver(self, name: UIApplication.didEnterBackgroundNotification, object: nil)
         center.removeObserver(self, name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.removeObserver(self, name: UIApplication.didBecomeActiveNotification, object: nil)
     }
 
     @objc private func enterBackground() {
@@ -813,6 +1012,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         // their layer is off-screen and nudging their PiP controller fails with
         // -1001 and fights the active player for the floating window.
         guard mpv != nil, isViewLoaded, view.window != nil else { return }
+        zdLog(pipProxyDiagnostics("enterBackground"))
         // Never disable the video track (vid=no) here: toggling it recreates the
         // whole video pipeline, breaks the VT decoder and leaves PiP black.
         guard isPlayerPlaying, let pip = pipController else {
@@ -832,6 +1032,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
 
     @objc private func enterForeground() {
         guard mpv != nil, isViewLoaded, view.window != nil else { return }
+        zdLog(pipProxyDiagnostics("enterForeground"))
         pipFallbackWorkItem?.cancel()
         pipFallbackWorkItem = nil
         endPipBackgroundTask()
